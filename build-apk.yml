@@ -1,0 +1,802 @@
+name: Compilar APK
+
+# Este archivo es autosuficiente: crea el proyecto Android y lo compila.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crear el proyecto Android
+        run: |
+          set -e
+          mkdir -p ZipInstaller
+          cd ZipInstaller
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'FIN_ARCHIVO'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.zipinstaller"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.zipinstaller"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.recyclerview:recyclerview:1.3.2")
+          }
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.ZipInstaller">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                      <!-- Permite "Abrir con" desde el gestor de archivos sobre un .zip -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="application/zip" />
+                          <data android:mimeType="application/x-zip-compressed" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/java/com/zipinstaller'
+          cat > 'app/src/main/java/com/zipinstaller/ApkAdapter.kt' <<'FIN_ARCHIVO'
+          package com.zipinstaller
+
+          import android.text.format.Formatter
+          import android.view.LayoutInflater
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.CheckBox
+          import android.widget.ImageView
+          import android.widget.TextView
+          import androidx.core.content.ContextCompat
+          import androidx.recyclerview.widget.RecyclerView
+
+          class ApkAdapter(
+              private val items: List<ApkItem>,
+              private val onChange: () -> Unit
+          ) : RecyclerView.Adapter<ApkAdapter.VH>() {
+
+              class VH(view: View) : RecyclerView.ViewHolder(view) {
+                  val check: CheckBox = view.findViewById(R.id.check)
+                  val icon: ImageView = view.findViewById(R.id.icon)
+                  val title: TextView = view.findViewById(R.id.title)
+                  val subtitle: TextView = view.findViewById(R.id.subtitle)
+              }
+
+              override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+                  val v = LayoutInflater.from(parent.context).inflate(R.layout.item_apk, parent, false)
+                  return VH(v)
+              }
+
+              override fun getItemCount(): Int = items.size
+
+              override fun onBindViewHolder(holder: VH, position: Int) {
+                  val item = items[position]
+                  val ctx = holder.itemView.context
+
+                  holder.title.text = item.label
+                  val parts = mutableListOf<String>()
+                  parts.add(item.packageName ?: "APK no legible")
+                  if (!item.version.isNullOrEmpty()) parts.add("v${item.version}")
+                  parts.add(Formatter.formatShortFileSize(ctx, item.size))
+                  holder.subtitle.text = parts.joinToString(" · ")
+
+                  holder.icon.setImageDrawable(
+                      item.icon ?: ContextCompat.getDrawable(ctx, android.R.drawable.sym_def_app_icon)
+                  )
+
+                  holder.check.setOnCheckedChangeListener(null)
+                  holder.check.isChecked = item.checked
+                  holder.check.setOnCheckedChangeListener { _, isChecked ->
+                      item.checked = isChecked
+                      onChange()
+                  }
+                  holder.itemView.setOnClickListener { holder.check.toggle() }
+              }
+          }
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/java/com/zipinstaller'
+          cat > 'app/src/main/java/com/zipinstaller/ApkItem.kt' <<'FIN_ARCHIVO'
+          package com.zipinstaller
+
+          import android.graphics.drawable.Drawable
+          import java.io.File
+
+          /** Un APK extraído del ZIP a la caché de la app. */
+          data class ApkItem(
+              val file: File,
+              val entryName: String,
+              val size: Long,
+              val packageName: String?,
+              val label: String,
+              val version: String?,
+              val icon: Drawable?,
+              var checked: Boolean
+          )
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/java/com/zipinstaller'
+          cat > 'app/src/main/java/com/zipinstaller/MainActivity.kt' <<'FIN_ARCHIVO'
+          package com.zipinstaller
+
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageInstaller
+          import android.graphics.drawable.Drawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.appcompat.widget.SwitchCompat
+          import androidx.core.content.ContextCompat
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import java.io.File
+          import java.io.FilterInputStream
+          import java.io.IOException
+          import java.io.InputStream
+          import java.io.OutputStream
+          import java.util.concurrent.Executors
+          import java.util.zip.ZipInputStream
+
+          class MainActivity : AppCompatActivity() {
+
+              companion object {
+                  private const val ACTION_INSTALL_RESULT = "com.zipinstaller.INSTALL_RESULT"
+                  private const val MAX_TOTAL_BYTES = 4L * 1024 * 1024 * 1024 // protección frente a "zip bombs"
+                  private const val MAX_DEPTH = 2 // ZIPs anidados (p. ej. un .xapk dentro de un .zip)
+              }
+
+              private val items = mutableListOf<ApkItem>()
+              private lateinit var adapter: ApkAdapter
+
+              private lateinit var btnPick: Button
+              private lateinit var btnInstall: Button
+              private lateinit var chkAll: CheckBox
+              private lateinit var swSplit: SwitchCompat
+              private lateinit var progress: ProgressBar
+              private lateinit var txtEmpty: TextView
+              private lateinit var txtLog: TextView
+              private lateinit var scrollLog: ScrollView
+
+              private val worker = Executors.newSingleThreadExecutor()
+              private val ui = Handler(Looper.getMainLooper())
+              private val queue = ArrayDeque<List<ApkItem>>()
+              private var totalGroups = 0
+              private var busy = false
+              private var extracted = 0L
+              private lateinit var workDir: File
+
+              private val pickZip = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null) loadZip(uri)
+              }
+
+              private val receiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context, intent: Intent) {
+                      val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
+                      when (status) {
+                          PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                              // Android pide al usuario que confirme la instalación.
+                              val confirm = confirmIntentFrom(intent)
+                              if (confirm != null) {
+                                  try {
+                                      startActivity(confirm)
+                                  } catch (e: Exception) {
+                                      log("✖ No se pudo abrir la confirmación: ${e.message}")
+                                      installNext()
+                                  }
+                              } else {
+                                  log("✖ El sistema no devolvió la pantalla de confirmación")
+                                  installNext()
+                              }
+                          }
+                          PackageInstaller.STATUS_SUCCESS -> {
+                              log("✔ Instalada correctamente")
+                              installNext()
+                          }
+                          else -> {
+                              val msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "sin detalles"
+                              log("✖ No instalada (código $status): $msg")
+                              installNext()
+                          }
+                      }
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun confirmIntentFrom(intent: Intent): Intent? =
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                  } else {
+                      intent.getParcelableExtra(Intent.EXTRA_INTENT)
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  workDir = File(cacheDir, "zip_apks")
+
+                  btnPick = findViewById(R.id.btnPick)
+                  btnInstall = findViewById(R.id.btnInstall)
+                  chkAll = findViewById(R.id.chkAll)
+                  swSplit = findViewById(R.id.swSplit)
+                  progress = findViewById(R.id.progress)
+                  txtEmpty = findViewById(R.id.txtEmpty)
+                  txtLog = findViewById(R.id.txtLog)
+                  scrollLog = findViewById(R.id.scrollLog)
+
+                  adapter = ApkAdapter(items) { updateButtons() }
+                  val list = findViewById<RecyclerView>(R.id.listApks)
+                  list.layoutManager = LinearLayoutManager(this)
+                  list.adapter = adapter
+
+                  btnPick.setOnClickListener {
+                      pickZip.launch(
+                          arrayOf(
+                              "application/zip",
+                              "application/x-zip-compressed",
+                              "application/octet-stream"
+                          )
+                      )
+                  }
+                  chkAll.setOnClickListener {
+                      val value = chkAll.isChecked
+                      items.filter { it.packageName != null }.forEach { it.checked = value }
+                      adapter.notifyDataSetChanged()
+                      updateButtons()
+                  }
+                  btnInstall.setOnClickListener { startInstall() }
+
+                  ContextCompat.registerReceiver(
+                      this,
+                      receiver,
+                      IntentFilter(ACTION_INSTALL_RESULT),
+                      ContextCompat.RECEIVER_NOT_EXPORTED
+                  )
+
+                  updateButtons()
+                  if (savedInstanceState == null) handleIntent(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleIntent(intent)
+              }
+
+              private fun handleIntent(intent: Intent?) {
+                  if (intent?.action == Intent.ACTION_VIEW) {
+                      intent.data?.let { loadZip(it) }
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  try {
+                      unregisterReceiver(receiver)
+                  } catch (_: Exception) {
+                  }
+                  if (isFinishing) {
+                      val dir = workDir
+                      worker.execute { dir.deleteRecursively() }
+                  }
+                  worker.shutdown()
+              }
+
+              // ---------------------------------------------------------------- ZIP
+
+              private fun loadZip(uri: Uri) {
+                  if (busy) {
+                      Toast.makeText(this, "Espera a que termine la operación actual", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  setBusy(true)
+                  items.clear()
+                  adapter.notifyDataSetChanged()
+                  txtLog.text = ""
+                  log("Leyendo ZIP…")
+
+                  worker.execute {
+                      val found = mutableListOf<ApkItem>()
+                      var error: String? = null
+                      try {
+                          workDir.deleteRecursively()
+                          workDir.mkdirs()
+                          extracted = 0L
+                          val stream = contentResolver.openInputStream(uri)
+                              ?: throw IOException("No se pudo abrir el archivo")
+                          stream.use { scan(it, "", 0, found) }
+                      } catch (e: Exception) {
+                          error = e.message ?: e.javaClass.simpleName
+                      }
+                      ui.post {
+                          items.addAll(found)
+                          adapter.notifyDataSetChanged()
+                          setBusy(false)
+                          if (error != null) {
+                              log("✖ Error al leer el ZIP: $error")
+                          } else if (found.isEmpty()) {
+                              log("El ZIP no contiene archivos .apk")
+                          } else {
+                              log("Encontrados ${found.size} APK(s). Marca los que quieras instalar.")
+                          }
+                      }
+                  }
+              }
+
+              /** Recorre el ZIP (y los ZIP/XAPK/APKS anidados) extrayendo los .apk a la caché. */
+              private fun scan(input: InputStream, prefix: String, depth: Int, out: MutableList<ApkItem>) {
+                  val zis = ZipInputStream(input)
+                  var entry = zis.nextEntry
+                  while (entry != null) {
+                      if (!entry.isDirectory) {
+                          val name = entry.name
+                          val lower = name.lowercase()
+                          if (lower.endsWith(".apk")) {
+                              // Solo se usa el nombre final: evita rutas con ".." (zip-slip).
+                              val safe = File(name).name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                              val dest = File(workDir, "${out.size}_$safe")
+                              dest.outputStream().use { o -> copyLimited(zis, o) }
+                              out.add(buildItem(dest, prefix + name))
+                          } else if (depth < MAX_DEPTH &&
+                              (lower.endsWith(".zip") || lower.endsWith(".xapk") || lower.endsWith(".apks"))
+                          ) {
+                              scan(NoClose(zis), "$prefix$name/", depth + 1, out)
+                          }
+                      }
+                      entry = zis.nextEntry
+                  }
+              }
+
+              private class NoClose(input: InputStream) : FilterInputStream(input) {
+                  override fun close() { /* no cierra el ZIP padre */ }
+              }
+
+              private fun copyLimited(input: InputStream, output: OutputStream) {
+                  val buf = ByteArray(64 * 1024)
+                  while (true) {
+                      val n = input.read(buf)
+                      if (n < 0) break
+                      extracted += n
+                      if (extracted > MAX_TOTAL_BYTES) throw IOException("El ZIP supera el tamaño máximo permitido")
+                      output.write(buf, 0, n)
+                  }
+              }
+
+              private fun buildItem(file: File, entryName: String): ApkItem {
+                  val pm = packageManager
+                  val info = try {
+                      pm.getPackageArchiveInfo(file.absolutePath, 0)
+                  } catch (e: Exception) {
+                      null
+                  }
+                  var label = File(entryName).name
+                  var icon: Drawable? = null
+                  var version: String? = null
+                  var pkg: String? = null
+                  if (info != null) {
+                      pkg = info.packageName
+                      version = info.versionName
+                      val ai = info.applicationInfo
+                      if (ai != null) {
+                          ai.sourceDir = file.absolutePath
+                          ai.publicSourceDir = file.absolutePath
+                          try {
+                              label = ai.loadLabel(pm).toString()
+                              icon = ai.loadIcon(pm)
+                          } catch (_: Exception) {
+                          }
+                      }
+                  }
+                  return ApkItem(file, entryName, file.length(), pkg, label, version, icon, info != null)
+              }
+
+              // ------------------------------------------------------------ Instalación
+
+              private fun startInstall() {
+                  val selected = items.filter { it.checked }
+                  if (selected.isEmpty()) return
+
+                  if (!packageManager.canRequestPackageInstalls()) {
+                      AlertDialog.Builder(this)
+                          .setTitle("Permiso necesario")
+                          .setMessage("Para instalar aplicaciones, Android requiere que actives \"Instalar apps desconocidas\" para esta app.")
+                          .setPositiveButton("Abrir ajustes") { _, _ ->
+                              startActivity(
+                                  Intent(
+                                      Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                      Uri.parse("package:$packageName")
+                                  )
+                              )
+                          }
+                          .setNegativeButton("Cancelar", null)
+                          .show()
+                      return
+                  }
+
+                  queue.clear()
+                  if (swSplit.isChecked) {
+                      queue.add(selected)
+                  } else {
+                      selected.forEach { queue.add(listOf(it)) }
+                  }
+                  totalGroups = queue.size
+                  setBusy(true)
+                  installNext()
+              }
+
+              private fun installNext() {
+                  val group = queue.removeFirstOrNull()
+                  if (group == null) {
+                      setBusy(false)
+                      log("Terminado.")
+                      return
+                  }
+                  val n = totalGroups - queue.size
+                  log("Instalando ($n/$totalGroups): ${group.joinToString { it.label }}")
+
+                  worker.execute {
+                      try {
+                          val installer = packageManager.packageInstaller
+                          val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+                          if (Build.VERSION.SDK_INT >= 31) {
+                              params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+                          }
+                          val id = installer.createSession(params)
+                          installer.openSession(id).use { session ->
+                              for ((i, apk) in group.withIndex()) {
+                                  apk.file.inputStream().use { input ->
+                                      session.openWrite("${i}_${apk.file.name}", 0, apk.file.length()).use { out ->
+                                          input.copyTo(out)
+                                          session.fsync(out)
+                                      }
+                                  }
+                              }
+                              val intent = Intent(ACTION_INSTALL_RESULT).setPackage(packageName)
+                              val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+                                  (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+                              val pending = PendingIntent.getBroadcast(this@MainActivity, id, intent, flags)
+                              session.commit(pending.intentSender)
+                          }
+                      } catch (e: Exception) {
+                          ui.post {
+                              log("✖ Error: ${e.message ?: e.javaClass.simpleName}")
+                              installNext()
+                          }
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------- UI
+
+              private fun setBusy(value: Boolean) {
+                  busy = value
+                  progress.visibility = if (value) View.VISIBLE else View.GONE
+                  btnPick.isEnabled = !value
+                  updateButtons()
+              }
+
+              private fun updateButtons() {
+                  val count = items.count { it.checked }
+                  btnInstall.isEnabled = !busy && count > 0
+                  btnInstall.text = if (count > 0) "Instalar ($count)" else getString(R.string.install)
+                  val selectable = items.filter { it.packageName != null }
+                  chkAll.isChecked = selectable.isNotEmpty() && selectable.all { it.checked }
+                  chkAll.isEnabled = !busy && selectable.isNotEmpty()
+                  txtEmpty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+              }
+
+              private fun log(message: String) {
+                  txtLog.append(message + "\n")
+                  scrollLog.post { scrollLog.fullScroll(View.FOCUS_DOWN) }
+              }
+          }
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/ic_launcher.xml' <<'FIN_ARCHIVO'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#3DDC84"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M26,30h56v48h-56z" />
+              <path
+                  android:fillColor="#0B3D20"
+                  android:pathData="M54,72L38,54L48,54L48,38L60,38L60,54L70,54Z" />
+          </vector>
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/activity_main.xml' <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fitsSystemWindows="true"
+              android:orientation="vertical"
+              android:padding="16dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="@string/title"
+                  android:textSize="22sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:text="@string/subtitle" />
+
+              <Button
+                  android:id="@+id/btnPick"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:text="@string/pick_zip" />
+
+              <FrameLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="8dp"
+                  android:layout_weight="1">
+
+                  <androidx.recyclerview.widget.RecyclerView
+                      android:id="@+id/listApks"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent" />
+
+                  <TextView
+                      android:id="@+id/txtEmpty"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_gravity="center"
+                      android:text="@string/empty" />
+              </FrameLayout>
+
+              <CheckBox
+                  android:id="@+id/chkAll"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="@string/select_all" />
+
+              <androidx.appcompat.widget.SwitchCompat
+                  android:id="@+id/swSplit"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:text="@string/split_mode" />
+
+              <Button
+                  android:id="@+id/btnInstall"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:enabled="false"
+                  android:text="@string/install" />
+
+              <ProgressBar
+                  android:id="@+id/progress"
+                  style="?android:attr/progressBarStyleHorizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:indeterminate="true"
+                  android:visibility="gone" />
+
+              <ScrollView
+                  android:id="@+id/scrollLog"
+                  android:layout_width="match_parent"
+                  android:layout_height="110dp"
+                  android:layout_marginTop="8dp">
+
+                  <TextView
+                      android:id="@+id/txtLog"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textSize="12sp" />
+              </ScrollView>
+          </LinearLayout>
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/item_apk.xml' <<'FIN_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:background="?attr/selectableItemBackground"
+              android:gravity="center_vertical"
+              android:orientation="horizontal"
+              android:paddingTop="6dp"
+              android:paddingBottom="6dp">
+
+              <CheckBox
+                  android:id="@+id/check"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content" />
+
+              <ImageView
+                  android:id="@+id/icon"
+                  android:layout_width="40dp"
+                  android:layout_height="40dp"
+                  android:contentDescription="@null" />
+
+              <LinearLayout
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="12dp"
+                  android:layout_weight="1"
+                  android:orientation="vertical">
+
+                  <TextView
+                      android:id="@+id/title"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:ellipsize="end"
+                      android:maxLines="1"
+                      android:textSize="16sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/subtitle"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textSize="12sp" />
+              </LinearLayout>
+          </LinearLayout>
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/strings.xml' <<'FIN_ARCHIVO'
+          <resources>
+              <string name="app_name">Instalador ZIP</string>
+              <string name="title">Instalador desde ZIP</string>
+              <string name="subtitle">Elige un ZIP que contenga APKs (también XAPK/APKS) y instálalos.</string>
+              <string name="pick_zip">Elegir archivo ZIP</string>
+              <string name="select_all">Seleccionar todo</string>
+              <string name="split_mode">Instalar lo marcado como un único paquete (APK divididos / XAPK)</string>
+              <string name="install">Instalar</string>
+              <string name="empty">No hay APKs cargados todavía.</string>
+          </resources>
+          FIN_ARCHIVO
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/themes.xml' <<'FIN_ARCHIVO'
+          <resources>
+              <style name="Theme.ZipInstaller" parent="Theme.Material3.DayNight.NoActionBar" />
+          </resources>
+          FIN_ARCHIVO
+          cat > 'build.gradle.kts' <<'FIN_ARCHIVO'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIN_ARCHIVO
+          cat > 'gradle.properties' <<'FIN_ARCHIVO'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          FIN_ARCHIVO
+          mkdir -p 'gradle/wrapper'
+          cat > 'gradle/wrapper/gradle-wrapper.properties' <<'FIN_ARCHIVO'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          FIN_ARCHIVO
+          cat > 'settings.gradle.kts' <<'FIN_ARCHIVO'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "ZipInstaller"
+          include(":app")
+          FIN_ARCHIVO
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Compilar APK (debug)
+        working-directory: ZipInstaller
+        run: gradle assembleDebug --no-daemon
+
+      - name: Subir el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZipInstaller-apk
+          path: ZipInstaller/app/build/outputs/apk/debug/app-debug.apk
